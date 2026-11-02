@@ -1,0 +1,75 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CENA Paper Trader</title><style>
+body{margin:0;background:#07090c;color:#c8f7d0;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace}
+.ban{background:#ffcc00;color:#000;font-weight:bold;text-align:center;padding:8px}
+header{display:flex;flex-wrap:wrap;gap:8px;padding:10px;border-bottom:1px solid #1f3}
+header h1{font-size:16px;margin:0 auto 0 0;color:#3f6}.st{background:#0d1410;border:1px solid #1a3a22;padding:6px 10px;border-radius:6px}
+.st b{display:block;font-size:15px;color:#fff}.g{color:#3f6}.r{color:#f55}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;padding:10px}
+.card{background:#0b1110;border:1px solid #1a3a22;border-radius:8px;padding:10px;min-height:60px}
+.card h3{margin:0 0 6px;font-size:13px;color:#7fffa0}.card small{color:#7a9}
+.log{max-height:320px;overflow:auto;font-size:12px}.log div{border-bottom:1px solid #132;padding:3px 0}
+table{width:100%;border-collapse:collapse;font-size:12px}td,th{padding:3px;text-align:left;border-bottom:1px solid #132}
+canvas{width:100%;height:140px}button{background:#132;color:#cfc;border:1px solid #3f6;padding:4px 8px;border-radius:4px}
+</style></head><body>
+<div class="ban">⚠️ PRACTICE MONEY ONLY — not financial advice. No real trades, no wallets, no accounts.</div>
+<header><h1>▮ CENA Paper Trader</h1>
+<div class="st">Balance<b id="bal">$10,000</b></div><div class="st">Trades<b id="tc">0</b></div>
+<div class="st">Wins<b id="w" class="g">0</b></div><div class="st">Losses<b id="l" class="r">0</b></div>
+<div class="st">Status<b id="stat">starting…</b></div></header>
+<div class="grid">
+<div class="card"><h3>🔭 Scanner</h3><small>Finds new boosted/trending pairs on DexScreener and looks for 5-min volume spikes.</small><div id="scan"></div></div>
+<div class="card"><h3>🛡️ Rug Check</h3><small>Rejects tokens with low liquidity, very new pairs, huge FDV vs liquidity, or dump-heavy selling (stand-ins for liquidity lock & holder concentration, which this free API doesn't show).</small><div id="rug"></div></div>
+<div class="card"><h3>📏 Sizer</h3><small>Each trade = 5% of equity, capped at $500. Max 5 open trades.</small><div id="siz"></div></div>
+<div class="card"><h3>⚡ Executor</h3><small>Pretend buys/sells at real live prices with 1% slippage. Stop-loss −8%, take-profit +12%, time exit 15 min.</small><div id="exe"></div></div>
+<div class="card"><h3>📈 Equity</h3><canvas id="eq" width="600" height="140"></canvas></div>
+<div class="card"><h3>💼 Live Trades</h3><table><thead><tr><th>Token</th><th>Size</th><th>Entry</th><th>Now</th><th>P/L</th></tr></thead><tbody id="open"></tbody></table></div>
+<div class="card" style="grid-column:1/-1"><h3>📝 Logger <button onclick="reset()">Reset $10k</button></h3><div class="log" id="log"></div></div>
+</div><script>
+const API='https://api.dexscreener.com',SL=-8,TP=12,SLIP=.01,MAXOPEN=5,MAXAGE=15*60e3;
+let S=JSON.parse(localStorage.cena||'null')||{cash:1e4,open:[],tc:0,w:0,l:0,eq:[1e4],log:[],cool:{}};
+const $=i=>document.getElementById(i),f=n=>'$'+n.toLocaleString(undefined,{maximumFractionDigits:2});
+function save(){localStorage.cena=JSON.stringify(S)}
+function reset(){localStorage.removeItem('cena');location.reload()}
+function log(m,c=''){S.log.unshift(`<span class="${c}">${new Date().toLocaleTimeString()} ${m}</span>`);S.log=S.log.slice(0,200)}
+function equity(){return S.cash+S.open.reduce((a,t)=>a+t.qty*(t.now||t.entry),0)}
+async function j(u){const r=await fetch(API+u);if(!r.ok)throw r.status;return r.json()}
+async function pairsFor(list){let out=[];const by={};list.forEach(x=>(by[x.c]=by[x.c]||[]).push(x.a));
+ for(const c in by)for(let i=0;i<by[c].length;i+=30){try{out=out.concat(await j(`/tokens/v1/${c}/${by[c].slice(i,i+30).join(',')}`))}catch(e){}}return out}
+function best(ps){const m={};ps.forEach(p=>{const k=p.baseToken.address;if(!m[k]||(p.liquidity?.usd||0)>(m[k].liquidity?.usd||0))m[k]=p});return Object.values(m)}
+function rug(p){const liq=p.liquidity?.usd||0,age=(Date.now()-(p.pairCreatedAt||0))/36e5,fdv=p.fdv||0,tx=p.txns?.h1||{buys:0,sells:0};
+ if(liq<25000)return'liquidity only '+f(liq)+' (<$25k)';if(age<2)return'pair is '+age.toFixed(1)+'h old (<2h)';
+ if(fdv/liq>200)return'FDV is '+Math.round(fdv/liq)+'× liquidity (concentration risk)';if(tx.sells>tx.buys*1.5)return'sellers outnumber buyers '+tx.sells+':'+tx.buys;
+ if((p.volume?.h1||0)<5000)return'too little volume';return null}
+async function cycle(){try{$('stat').textContent='scanning';
+ const [b,pr]=await Promise.all([j('/token-boosts/latest/v1'),j('/token-profiles/latest/v1')]);
+ const ids=[...b,...pr].map(x=>({c:x.chainId,a:x.tokenAddress}));const uniq=[...new Map(ids.map(x=>[x.c+x.a,x])).values()].slice(0,90);
+ const openIds=S.open.map(t=>({c:t.c,a:t.a}));const ps=best(await pairsFor(uniq.concat(openIds)));
+ const by=Object.fromEntries(ps.map(p=>[p.baseToken.address,p]));
+ // manage open trades
+ for(const t of [...S.open]){const p=by[t.a];if(!p)continue;t.now=+p.priceUsd;const pl=(t.now*(1-SLIP)/t.entry-1)*100;
+  let why=pl<=SL?`stop-loss hit (${pl.toFixed(1)}%)`:pl>=TP?`take-profit hit (+${pl.toFixed(1)}%)`:Date.now()-t.t>MAXAGE?`time exit after 15 min (${pl.toFixed(1)}%)`:null;
+  if(why){const got=t.qty*t.now*(1-SLIP);S.cash+=got;S.tc++;const win=got>t.cost;win?S.w++:S.l++;S.open=S.open.filter(x=>x!==t);S.cool[t.a]=Date.now();
+   log(`SELL ${t.sym} ${f(got)} — ${why}. ${win?'WIN':'LOSS'} ${f(got-t.cost)}`,win?'g':'r')}}
+ // scan
+ const spikes=ps.filter(p=>p.priceUsd&&(p.volume?.m5||0)>0).map(p=>({p,spike:(p.volume.m5*12)/Math.max(p.volume.h1||1,1)}));
+ $('scan').innerHTML=`<br>${ps.length} live pairs checked<br>`+spikes.sort((a,b)=>b.spike-a.spike).slice(0,4).map(s=>`${s.p.baseToken.symbol} vol×${s.spike.toFixed(1)} 5m ${s.p.priceChange?.m5??0}%`).join('<br>');
+ let rej=0,pass=[];for(const s of spikes){if(S.open.find(t=>t.a===s.p.baseToken.address)||Date.now()-(S.cool[s.p.baseToken.address]||0)<36e5)continue;const r=rug(s.p);if(r){rej++;continue}pass.push(s)}
+ $('rug').innerHTML=`<br>✅ passed: ${pass.length} &nbsp; ❌ rejected: ${rej}`;
+ const cands=pass.filter(s=>s.spike>1&&(s.p.priceChange?.m5||0)>0.3).sort((a,b)=>b.spike-a.spike);
+ for(const s of cands){if(S.open.length>=MAXOPEN)break;const eq=equity(),size=Math.min(eq*.05,500);if(S.cash<size)break;
+  const p=s.p,price=+p.priceUsd*(1+SLIP);S.cash-=size;S.open.push({a:p.baseToken.address,c:p.chainId,sym:p.baseToken.symbol,entry:price,now:+p.priceUsd,qty:size/price,cost:size,t:Date.now(),url:p.url});
+  log(`BUY ${p.baseToken.symbol} (${p.chainId}) ${f(size)} @ ${price.toPrecision(4)} — volume spike ×${s.spike.toFixed(1)}, up ${p.priceChange.m5}% in 5m, liquidity ${f(p.liquidity.usd)}, passed rug check`,'g')}
+ if(!cands.length)log(`No trade: ${pass.length} safe tokens but none with a volume spike + rising price right now`);
+ $('siz').innerHTML=`<br>Equity ${f(equity())} → next trade ${f(Math.min(equity()*.05,500))}`;
+ $('exe').innerHTML=`<br>Open: ${S.open.length}/${MAXOPEN} · Cash ${f(S.cash)}`;
+ S.eq.push(equity());S.eq=S.eq.slice(-300);$('stat').textContent='live ✓';}catch(e){$('stat').textContent='retrying';log('Data error, retrying: '+e,'r')}
+ save();draw()}
+function draw(){$('bal').textContent=f(equity());$('tc').textContent=S.tc;$('w').textContent=S.w;$('l').textContent=S.l;
+ $('open').innerHTML=S.open.map(t=>{const pl=(t.now*(1-SLIP)/t.entry-1)*100;return`<tr><td><a style="color:#7fffa0" target=_blank href="${t.url}">${t.sym}</a></td><td>${f(t.cost)}</td><td>${t.entry.toPrecision(4)}</td><td>${t.now.toPrecision(4)}</td><td class="${pl>=0?'g':'r'}">${pl.toFixed(1)}%</td></tr>`}).join('')||'<tr><td colspan=5>none yet</td></tr>';
+ $('log').innerHTML=S.log.map(x=>'<div>'+x+'</div>').join('');
+ const c=$('eq'),x=c.getContext('2d'),d=S.eq,mn=Math.min(...d),mx=Math.max(...d)||1;x.clearRect(0,0,600,140);x.strokeStyle='#3f6';x.beginPath();
+ d.forEach((v,i)=>{const X=i/(Math.max(d.length-1,1))*600,Y=130-(v-mn)/((mx-mn)||1)*120;i?x.lineTo(X,Y):x.moveTo(X,Y)});x.stroke();
+ x.fillStyle='#7a9';x.fillText(f(mx),4,12);x.fillText(f(mn),4,136)}
+draw();cycle();setInterval(cycle,20000);
+</script></body></html>
